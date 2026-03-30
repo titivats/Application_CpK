@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+
+venv/
+build/
+dist/
+.mplconfig/
+
+*.log
+tmp_*.pdf
+tmp_*.png

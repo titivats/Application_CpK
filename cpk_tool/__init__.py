@@ -1,0 +1,1 @@
+"""Machine capability report generator."""
