@@ -1,7 +1,7 @@
 # -*- mode: python ; coding: utf-8 -*-
 from PyInstaller.utils.hooks import collect_data_files
 
-datas = [('Icon\\Program.png', 'Icon'), ('assets\\program_source.ico', 'assets'), ('assets\\program_source_256.png', 'assets')]
+datas = [('assets/source/Program.png', 'assets/source'), ('assets\\program_source.ico', 'assets'), ('assets\\program_source_256.png', 'assets')]
 datas += collect_data_files('matplotlib')
 datas += collect_data_files('reportlab')
 

@@ -6,8 +6,8 @@ from PIL import Image
 
 
 ROOT = Path(__file__).resolve().parents[1]
-SOURCE_PNG = ROOT / "Icon" / "Program.png"
 ASSET_DIR = ROOT / "assets"
+SOURCE_PNG = ASSET_DIR / "source" / "Program.png"
 OUTPUT_PNG = ASSET_DIR / "program_source_256.png"
 OUTPUT_ICO = ASSET_DIR / "program_source.ico"
 

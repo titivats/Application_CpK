@@ -7,6 +7,11 @@ import tempfile
 
 
 def _prepare_runtime_environment() -> None:
+    if sys.platform == "win32":
+        # Tk 8.6 initializes its font scaling when the first window is created.
+        import ctypes
+        ctypes.windll.user32.SetProcessDPIAware()
+
     if not getattr(sys, "frozen", False):
         base_prefix = Path(sys.base_prefix)
         dll_dir = base_prefix / "DLLs"

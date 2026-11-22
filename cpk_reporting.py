@@ -1,10 +1,9 @@
 from __future__ import annotations
 
-from collections import OrderedDict
 from io import BytesIO
 import math
 from pathlib import Path
-import textwrap
+from tempfile import NamedTemporaryFile
 from statistics import NormalDist
 
 from matplotlib.figure import Figure
@@ -16,7 +15,7 @@ from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.pdfgen import canvas
 
-from cpk_tool.analysis import AxisReport, ReportMetadata, format_metric
+from cpk_tool.analysis import AxisReport, ReportMetadata, format_metric, format_ppm, overall_result
 
 
 PAGE_SIZE = landscape(A4)
@@ -32,13 +31,12 @@ ACCENT_SOFT = "#D6F2EE"
 WARNING = "#C2410C"
 PASS = "#18794E"
 FAIL = "#B42318"
+STATUS_COLORS = {"PASS": PASS, "FAIL": FAIL, "N/A": MUTED}
 WITHIN = "#D97706"
 OVERALL = "#2563EB"
 SPEC = "#B91C1C"
 TARGET = "#7C3AED"
 SECTION_RENDER_DPI = 160
-SECTION_IMAGE_CACHE_LIMIT = 48
-_SECTION_IMAGE_CACHE: OrderedDict[tuple[object, ...], bytes] = OrderedDict()
 
 
 def create_axis_figure(report: AxisReport) -> Figure:
@@ -365,6 +363,37 @@ def create_capability_summary_figure(
     return create_axis_summary_figure(report, figure_size=figure_size)
 
 
+def _performance_rows(report: AxisReport):
+    models = (report.observed_ppm, report.overall_ppm, report.within_ppm)
+    return [
+        ("Below LSL", *(format_ppm(p.below) for p in models)),
+        ("Above USL", *(format_ppm(p.above) for p in models)),
+        ("Total", *(format_ppm(p.total) for p in models)),
+    ]
+
+
+def create_performance_figure(
+    report: AxisReport, *, figure_size: tuple[float, float] = (11.8, 7.2)
+) -> Figure:
+    figure = Figure(figsize=figure_size, facecolor=PAPER, layout="constrained")
+    axis = figure.subplots()
+    axis.set_axis_off()
+    axis.text(.04, .91, f"Axis {report.spec.axis_name}   /   Performance", fontsize=22, color=INK)
+    axis.text(.04, .80, f"Cpm {format_metric(report.cpm, 3)}    |    "
+              f"Outside specification: {report.observed_oos_count} of {report.sample_count}", fontsize=14)
+    table = axis.table(cellText=_performance_rows(report),
+                       colLabels=("PPM", "Observed", "Expected overall", "Expected within"),
+                       bbox=(.04, .31, .92, .40), cellLoc="right")
+    table.auto_set_font_size(False)
+    table.set_fontsize(12)
+    for (row, _), cell in table.get_celld().items():
+        cell.set_edgecolor(PANEL)
+        cell.set_facecolor(ACCENT if row == 0 else ACCENT_SOFT)
+        cell.get_text().set_color(PANEL if row == 0 else INK)
+    axis.text(.04, .23, "Expected PPM assumes a normal distribution.", fontsize=12, color=MUTED)
+    return figure
+
+
 def _create_single_chart_figure(
     report: AxisReport,
     title: str,
@@ -377,43 +406,6 @@ def _create_single_chart_figure(
     figure.subplots_adjust(left=0.075, right=0.985, top=0.90, bottom=0.12)
     plotter(axis, report)
     return figure
-
-
-SECTION_FACTORIES = (
-    ("Capability Histogram", create_capability_histogram_figure),
-    ("Normal Probability Plot", create_normal_probability_figure),
-    ("Run Chart (30 Trials)", create_run_chart_figure),
-    ("Capability Summary", create_capability_summary_figure),
-)
-
-
-def export_pdf(metadata: ReportMetadata, reports: list[AxisReport], output_path: str | Path) -> Path:
-    destination = Path(output_path)
-    destination.parent.mkdir(parents=True, exist_ok=True)
-
-    regular_font, bold_font = _register_fonts()
-    pdf = canvas.Canvas(str(destination), pagesize=PAGE_SIZE, pageCompression=0)
-    pdf.setTitle(metadata.report_title or "Machine Capability Report")
-
-    _draw_cover_page(pdf, metadata, reports, regular_font, bold_font)
-    page_number = 2
-    for report in reports:
-        for section_index, (section_title, figure_factory) in enumerate(SECTION_FACTORIES, start=1):
-            _draw_axis_section_page(
-                pdf,
-                metadata,
-                report,
-                regular_font,
-                bold_font,
-                page_number,
-                section_index,
-                section_title,
-                figure_factory,
-            )
-            page_number += 1
-
-    pdf.save()
-    return destination
 
 
 def figure_to_png_bytes(figure: Figure, *, dpi: int = SECTION_RENDER_DPI) -> bytes:
@@ -430,456 +422,15 @@ def figure_to_png_bytes(figure: Figure, *, dpi: int = SECTION_RENDER_DPI) -> byt
         figure.clear()
 
 
-def _report_signature(report: AxisReport) -> tuple[object, ...]:
-    spec = report.spec
-    return (
-        spec.axis_name,
-        spec.lsl,
-        spec.usl,
-        spec.target,
-        spec.cpk_requirement,
-        tuple(report.values),
-    )
-
-
-def _get_cached_section_image(report: AxisReport, section_title: str, figure_factory) -> bytes:
-    cache_key = (_report_signature(report), section_title)
-    cached_image = _SECTION_IMAGE_CACHE.get(cache_key)
-    if cached_image is not None:
-        _SECTION_IMAGE_CACHE.move_to_end(cache_key)
-        return cached_image
-
-    image_bytes = figure_to_png_bytes(figure_factory(report))
-    _SECTION_IMAGE_CACHE[cache_key] = image_bytes
-    if len(_SECTION_IMAGE_CACHE) > SECTION_IMAGE_CACHE_LIMIT:
-        _SECTION_IMAGE_CACHE.popitem(last=False)
-    return image_bytes
-
-
-def _draw_cover_page(
-    pdf: canvas.Canvas,
-    metadata: ReportMetadata,
-    reports: list[AxisReport],
-    regular_font: str,
-    bold_font: str,
-) -> None:
-    title = metadata.report_title or "Machine Cpk Capability Report"
-    overall_status = "PASS" if all(report.status == "PASS" for report in reports) else "FAIL"
-    status_color = PASS if overall_status == "PASS" else FAIL
-
-    pdf.setFillColor(HexColor(PAPER))
-    pdf.rect(0, 0, PAGE_WIDTH, PAGE_HEIGHT, fill=1, stroke=0)
-
-    pdf.setFillColor(HexColor(INK))
-    pdf.setFont(bold_font, 24)
-    pdf.drawString(PAGE_MARGIN, PAGE_HEIGHT - 52, title)
-
-    pdf.setFillColor(HexColor(MUTED))
-    pdf.setFont(regular_font, 11)
-    pdf.drawString(
-        PAGE_MARGIN,
-        PAGE_HEIGHT - 72,
-        _describe_axis_scope(reports),
-    )
-
-    _draw_status_badge(
-        pdf,
-        x=PAGE_WIDTH - 140,
-        y=PAGE_HEIGHT - 70,
-        width=96,
-        height=28,
-        text=overall_status,
-        fill_color=status_color,
-        font_name=bold_font,
-        font_size=13,
-    )
-
-    info_top = PAGE_HEIGHT - 105
-    info_items = [
-        ("Customer", metadata.customer_name or "-"),
-        ("Machine", metadata.machine_name or "-"),
-        ("Machine Model", metadata.machine_model or "-"),
-        ("Measurement Tool", metadata.measurement_tool_name or "-"),
-        ("Tool Model", metadata.measurement_tool_model or "-"),
-        ("Part Name", metadata.part_name or "-"),
-        ("Serial No.", metadata.serial_number or "-"),
-        ("Inspected By", metadata.inspected_by or "-"),
-        ("Report Date", metadata.report_date or "-"),
-    ]
-    card_width = (PAGE_WIDTH - (PAGE_MARGIN * 2) - 36) / 3
-    row_height = 34
-    for index, (label, value) in enumerate(info_items):
-        row = index % 3
-        column = index // 3
-        x = PAGE_MARGIN + column * (card_width + 18)
-        y = info_top - (row * (row_height + 8))
-        pdf.setFillColor(HexColor(PANEL))
-        pdf.roundRect(x, y - row_height, card_width, row_height, 8, fill=1, stroke=0)
-        pdf.setStrokeColor(HexColor("#D9E0E7"))
-        pdf.roundRect(x, y - row_height, card_width, row_height, 8, fill=0, stroke=1)
-        pdf.setFillColor(HexColor(MUTED))
-        pdf.setFont(regular_font, 9.5)
-        pdf.drawString(x + 12, y - 12, label)
-        pdf.setFillColor(HexColor(INK))
-        pdf.setFont(bold_font, 11)
-        pdf.drawString(x + 12, y - 25, _clip_text(value, 28))
-
-    table_top = PAGE_HEIGHT - 255
-    pdf.setFillColor(HexColor(INK))
-    pdf.setFont(bold_font, 15)
-    pdf.drawString(PAGE_MARGIN, table_top, "Axis Summary")
-
-    headers = ["Axis", "Mean", "Within Sigma", "Overall Sigma", "Cp", "Cpk", "Ppk", "Result"]
-    widths = [70, 90, 90, 90, 70, 70, 70, 84]
-    table_x = PAGE_MARGIN
-    table_y = table_top - 18
-    table_row_height = 28
-
-    pdf.setFillColor(HexColor(ACCENT))
-    pdf.roundRect(table_x, table_y - table_row_height, sum(widths), table_row_height, 8, fill=1, stroke=0)
-    pdf.setFillColor(HexColor(PANEL))
-    pdf.setFont(bold_font, 10.5)
-    cell_x = table_x
-    for header, width in zip(headers, widths):
-        pdf.drawCentredString(cell_x + (width / 2), table_y - 18, header)
-        cell_x += width
-
-    body_y = table_y - table_row_height - 8
-    for report in reports:
-        pdf.setFillColor(HexColor(PANEL))
-        pdf.roundRect(table_x, body_y - table_row_height + 6, sum(widths), table_row_height, 8, fill=1, stroke=0)
-        pdf.setStrokeColor(HexColor("#D9E0E7"))
-        pdf.roundRect(table_x, body_y - table_row_height + 6, sum(widths), table_row_height, 8, fill=0, stroke=1)
-
-        row_values = [
-            report.spec.axis_name,
-            format_metric(report.mean, 4),
-            format_metric(report.within_std, 4),
-            format_metric(report.overall_std, 4),
-            format_metric(report.cp, 3),
-            format_metric(report.cpk, 3),
-            format_metric(report.ppk, 3),
-            report.status,
-        ]
-        cell_x = table_x
-        for value, width in zip(row_values, widths):
-            value_color = INK
-            if value in {"PASS", "FAIL"}:
-                value_color = PASS if value == "PASS" else FAIL
-            pdf.setFillColor(HexColor(value_color))
-            pdf.setFont(bold_font if value in {"PASS", "FAIL"} else regular_font, 10.5)
-            pdf.drawCentredString(cell_x + (width / 2), body_y - 12, value)
-            cell_x += width
-        body_y -= table_row_height + 8
-
-    notes_title_y = body_y - 18
-    pdf.setFillColor(HexColor(INK))
-    pdf.setFont(bold_font, 15)
-    pdf.drawString(PAGE_MARGIN, notes_title_y, "Notes")
-
-    notes_text = metadata.notes.strip() or "No additional notes."
-    wrapped_lines = simpleSplit(
-        notes_text,
-        regular_font,
-        10.5,
-        PAGE_WIDTH - (PAGE_MARGIN * 2) - 24,
-    )
-    box_y = notes_title_y - 12
-    box_height = max(84, (len(wrapped_lines) * 13) + 24)
-    pdf.setFillColor(HexColor(PANEL))
-    pdf.roundRect(
-        PAGE_MARGIN,
-        box_y - box_height,
-        PAGE_WIDTH - (PAGE_MARGIN * 2),
-        box_height,
-        10,
-        fill=1,
-        stroke=0,
-    )
-    pdf.setStrokeColor(HexColor("#D9E0E7"))
-    pdf.roundRect(
-        PAGE_MARGIN,
-        box_y - box_height,
-        PAGE_WIDTH - (PAGE_MARGIN * 2),
-        box_height,
-        10,
-        fill=0,
-        stroke=1,
-    )
-    text_object = pdf.beginText(PAGE_MARGIN + 12, box_y - 20)
-    text_object.setFont(regular_font, 10.5)
-    text_object.setFillColor(HexColor(INK))
-    for line in wrapped_lines:
-        text_object.textLine(line)
-    pdf.drawText(text_object)
-
-    _draw_footer(pdf, regular_font, 1)
-    pdf.showPage()
-
-
-def _draw_axis_charts_page(
-    pdf: canvas.Canvas,
-    metadata: ReportMetadata,
-    report: AxisReport,
-    regular_font: str,
-    bold_font: str,
-    page_number: int,
-) -> None:
-    status_color = PASS if report.status == "PASS" else FAIL
-    spec = report.spec
-
-    pdf.setFillColor(HexColor(PAPER))
-    pdf.rect(0, 0, PAGE_WIDTH, PAGE_HEIGHT, fill=1, stroke=0)
-
-    pdf.setFillColor(HexColor(INK))
-    pdf.setFont(bold_font, 20)
-    pdf.drawString(PAGE_MARGIN, PAGE_HEIGHT - 44, f"Axis {spec.axis_name} Capability Analysis")
-
-    pdf.setFillColor(HexColor(MUTED))
-    pdf.setFont(regular_font, 10.5)
-    subtitle = (
-        f"Customer: {metadata.customer_name or '-'}   |   "
-        f"Machine: {_format_machine_descriptor(metadata)}   |   "
-        f"Inspector: {metadata.inspected_by or '-'}"
-    )
-    pdf.drawString(PAGE_MARGIN, PAGE_HEIGHT - 60, _clip_text(subtitle, 110))
-
-    _draw_status_badge(
-        pdf,
-        x=PAGE_WIDTH - 140,
-        y=PAGE_HEIGHT - 60,
-        width=96,
-        height=24,
-        text=report.status,
-        fill_color=status_color,
-        font_name=bold_font,
-        font_size=11.5,
-    )
-
-    spec_line = (
-        f"LSL {format_metric(spec.lsl)}   |   "
-        f"Target {format_metric(spec.resolved_target)}   |   "
-        f"USL {format_metric(spec.usl)}   |   "
-        f"Required Cpk >= {format_metric(spec.cpk_requirement, 2)}"
-    )
-    pdf.setFillColor(HexColor(INK))
-    pdf.setFont(regular_font, 10)
-    pdf.drawString(PAGE_MARGIN, PAGE_HEIGHT - 82, spec_line)
-
-    image_data = _get_cached_section_image(report, "Combined Capability Charts", create_axis_pdf_charts_figure)
-    image = ImageReader(BytesIO(image_data))
-    pdf.drawImage(
-        image,
-        PAGE_MARGIN,
-        32,
-        width=PAGE_WIDTH - (PAGE_MARGIN * 2),
-        height=PAGE_HEIGHT - 128,
-        preserveAspectRatio=True,
-        anchor="c",
-        mask="auto",
-    )
-
-    _draw_footer(pdf, regular_font, page_number)
-    pdf.showPage()
-
-
-def _draw_axis_summary_page(
-    pdf: canvas.Canvas,
-    metadata: ReportMetadata,
-    report: AxisReport,
-    regular_font: str,
-    bold_font: str,
-    page_number: int,
-) -> None:
-    status_color = PASS if report.status == "PASS" else FAIL
-    spec = report.spec
-
-    pdf.setFillColor(HexColor(PAPER))
-    pdf.rect(0, 0, PAGE_WIDTH, PAGE_HEIGHT, fill=1, stroke=0)
-
-    pdf.setFillColor(HexColor(INK))
-    pdf.setFont(bold_font, 20)
-    pdf.drawString(PAGE_MARGIN, PAGE_HEIGHT - 44, f"Axis {spec.axis_name} Capability Analysis (2)")
-
-    pdf.setFillColor(HexColor(MUTED))
-    pdf.setFont(regular_font, 10.5)
-    subtitle = (
-        f"Customer: {metadata.customer_name or '-'}   |   "
-        f"Machine: {_format_machine_descriptor(metadata)}   |   "
-        f"Inspector: {metadata.inspected_by or '-'}"
-    )
-    pdf.drawString(PAGE_MARGIN, PAGE_HEIGHT - 60, _clip_text(subtitle, 110))
-
-    _draw_status_badge(
-        pdf,
-        x=PAGE_WIDTH - 140,
-        y=PAGE_HEIGHT - 60,
-        width=96,
-        height=24,
-        text=report.status,
-        fill_color=status_color,
-        font_name=bold_font,
-        font_size=11.5,
-    )
-
-    spec_line = (
-        f"Capability Summary   |   "
-        f"LSL {format_metric(spec.lsl)}   |   "
-        f"Target {format_metric(spec.resolved_target)}   |   "
-        f"USL {format_metric(spec.usl)}"
-    )
-    pdf.setFillColor(HexColor(INK))
-    pdf.setFont(regular_font, 10)
-    pdf.drawString(PAGE_MARGIN, PAGE_HEIGHT - 82, spec_line)
-
-    image_data = _get_cached_section_image(report, "Detailed Capability Summary", create_axis_summary_figure)
-    image = ImageReader(BytesIO(image_data))
-    pdf.drawImage(
-        image,
-        PAGE_MARGIN,
-        32,
-        width=PAGE_WIDTH - (PAGE_MARGIN * 2),
-        height=PAGE_HEIGHT - 128,
-        preserveAspectRatio=True,
-        anchor="c",
-        mask="auto",
-    )
-
-    _draw_footer(pdf, regular_font, page_number)
-    pdf.showPage()
-
-
-def _draw_axis_section_page(
-    pdf: canvas.Canvas,
-    metadata: ReportMetadata,
-    report: AxisReport,
-    regular_font: str,
-    bold_font: str,
-    page_number: int,
-    section_index: int,
-    section_title: str,
-    figure_factory,
-) -> None:
-    status_color = PASS if report.status == "PASS" else FAIL
-    spec = report.spec
-    title_suffix = "" if section_index == 1 else f" ({section_index})"
-
-    pdf.setFillColor(HexColor(PAPER))
-    pdf.rect(0, 0, PAGE_WIDTH, PAGE_HEIGHT, fill=1, stroke=0)
-
-    pdf.setFillColor(HexColor(INK))
-    pdf.setFont(bold_font, 20)
-    pdf.drawString(PAGE_MARGIN, PAGE_HEIGHT - 44, f"Axis {spec.axis_name} Capability Analysis{title_suffix}")
-
-    pdf.setFillColor(HexColor(MUTED))
-    pdf.setFont(regular_font, 10.5)
-    subtitle = (
-        f"Customer: {metadata.customer_name or '-'}   |   "
-        f"Machine: {_format_machine_descriptor(metadata)}   |   "
-        f"Inspector: {metadata.inspected_by or '-'}"
-    )
-    pdf.drawString(PAGE_MARGIN, PAGE_HEIGHT - 60, _clip_text(subtitle, 110))
-
-    _draw_status_badge(
-        pdf,
-        x=PAGE_WIDTH - 140,
-        y=PAGE_HEIGHT - 60,
-        width=96,
-        height=24,
-        text=report.status,
-        fill_color=status_color,
-        font_name=bold_font,
-        font_size=11.5,
-    )
-
-    spec_line = (
-        f"{section_title}   |   "
-        f"LSL {format_metric(spec.lsl)}   |   "
-        f"Target {format_metric(spec.resolved_target)}   |   "
-        f"USL {format_metric(spec.usl)}   |   "
-        f"Required Cpk >= {format_metric(spec.cpk_requirement, 2)}"
-    )
-    pdf.setFillColor(HexColor(INK))
-    pdf.setFont(regular_font, 10)
-    pdf.drawString(PAGE_MARGIN, PAGE_HEIGHT - 82, _clip_text(spec_line, 150))
-
-    image_data = _get_cached_section_image(report, section_title, figure_factory)
-    image = ImageReader(BytesIO(image_data))
-    pdf.drawImage(
-        image,
-        PAGE_MARGIN,
-        32,
-        width=PAGE_WIDTH - (PAGE_MARGIN * 2),
-        height=PAGE_HEIGHT - 128,
-        preserveAspectRatio=True,
-        anchor="c",
-        mask="auto",
-    )
-
-    _draw_footer(pdf, regular_font, page_number)
-    pdf.showPage()
-
-
-def _draw_footer(pdf: canvas.Canvas, regular_font: str, page_number: int) -> None:
-    pdf.setFillColor(HexColor(MUTED))
-    pdf.setFont(regular_font, 9)
-    pdf.drawString(PAGE_MARGIN, 16, "Generated by Machine Cpk Capability Reporter")
-    pdf.drawRightString(PAGE_WIDTH - PAGE_MARGIN, 16, f"Page {page_number}")
-
-
-def _format_machine_descriptor(metadata: ReportMetadata) -> str:
-    if metadata.machine_name and metadata.machine_model:
-        return f"{metadata.machine_name} ({metadata.machine_model})"
-    return metadata.machine_name or metadata.machine_model or "-"
-
-
-def _describe_axis_scope(reports: list[AxisReport]) -> str:
-    axis_names = [report.spec.axis_name for report in reports]
-    if not axis_names:
-        return "Machine capability report for repeatability verification"
-
-    axis_list = ", ".join(axis_names)
-    if len(axis_names) <= 6 and len(axis_list) <= 48:
-        return f"Machine capability report for repeatability verification across {axis_list}"
-    return (
-        "Machine capability report for repeatability verification across "
-        f"{len(axis_names)} axes"
-    )
-
-
-def _draw_status_badge(
-    pdf: canvas.Canvas,
-    *,
-    x: float,
-    y: float,
-    width: float,
-    height: float,
-    text: str,
-    fill_color: str,
-    font_name: str,
-    font_size: float,
-) -> None:
-    pdf.setFillColor(HexColor(fill_color))
-    pdf.roundRect(x, y, width, height, 8, fill=1, stroke=0)
-
-    ascent = pdfmetrics.getAscent(font_name) * font_size / 1000.0
-    descent = abs(pdfmetrics.getDescent(font_name) * font_size / 1000.0)
-    baseline = y + ((height - ascent + descent) / 2.0)
-
-    pdf.setFillColor(HexColor(PANEL))
-    pdf.setFont(font_name, font_size)
-    pdf.drawCentredString(x + (width / 2.0), baseline, text)
-
-
 def _register_fonts() -> tuple[str, str]:
     regular_candidates = [
-        Path("C:/Windows/Fonts/LeelawUI.ttf"),
         Path("C:/Windows/Fonts/tahoma.ttf"),
+        Path("C:/Windows/Fonts/LeelawUI.ttf"),
         Path("C:/Windows/Fonts/arial.ttf"),
     ]
     bold_candidates = [
-        Path("C:/Windows/Fonts/leelawdb.ttf"),
         Path("C:/Windows/Fonts/tahomabd.ttf"),
+        Path("C:/Windows/Fonts/leelawdb.ttf"),
         Path("C:/Windows/Fonts/arialbd.ttf"),
     ]
 
@@ -910,7 +461,7 @@ def _draw_vertical_spec_lines(axis, report: AxisReport) -> None:
         color=TARGET,
         linewidth=1.3,
         linestyle=":",
-        label="Target",
+        label="Target" if report.spec.target is not None else "Spec midpoint",
     )
 
 
@@ -922,7 +473,7 @@ def _draw_horizontal_spec_lines(axis, report: AxisReport) -> None:
         color=TARGET,
         linewidth=1.2,
         linestyle=":",
-        label="Target",
+        label="Target" if report.spec.target is not None else "Spec midpoint",
     )
 
 
@@ -1053,7 +604,7 @@ def _draw_summary_panel(summary_axis, report: AxisReport, x_min: float, x_max: f
         spine.set_color("#D9E0E7")
         spine.set_linewidth(1.1)
 
-    status_color = PASS if report.status == "PASS" else FAIL
+    status_color = STATUS_COLORS[report.status]
     spec = report.spec
 
     summary_axis.text(
@@ -1089,7 +640,7 @@ def _draw_summary_panel(summary_axis, report: AxisReport, x_min: float, x_max: f
         ("Cpu / Cpl", f"{format_metric(report.cpu, 3)} / {format_metric(report.cpl, 3)}"),
         ("Pp / Ppk", f"{format_metric(report.pp, 3)} / {format_metric(report.ppk, 3)}"),
         ("Ppu / Ppl", f"{format_metric(report.ppu, 3)} / {format_metric(report.ppl, 3)}"),
-        ("Predicted OOS", f"{report.predicted_oos_ppm:.1f} ppm"),
+        ("Predicted OOS", format_ppm(report.predicted_oos_ppm) + " ppm"),
     ]
     if report.observed_oos_count > 0:
         right_metrics.insert(
@@ -1103,9 +654,9 @@ def _draw_summary_panel(summary_axis, report: AxisReport, x_min: float, x_max: f
     detail_y = 0.31
     detail_lines = [
         f"Spec Limits: {format_metric(spec.lsl)} to {format_metric(spec.usl)}",
-        f"Target: {format_metric(spec.resolved_target)}",
+        f"Target: {spec.target if spec.target is not None else 'Not set'}",
         f"Required Cpk: >= {format_metric(spec.cpk_requirement, 2)}",
-        f"Expected Yield: {report.expected_yield_percent:.3f}%",
+        f"Expected Yield: {format_metric(report.expected_yield_percent, 3, unit='%')}",
     ]
     for line in detail_lines:
         summary_axis.text(
@@ -1147,7 +698,7 @@ def _draw_summary_sheet(summary_axis, report: AxisReport) -> None:
         spine.set_linewidth(1.2)
 
     spec = report.spec
-    status_color = PASS if report.status == "PASS" else FAIL
+    status_color = STATUS_COLORS[report.status]
 
     summary_axis.text(
         0.04,
@@ -1198,8 +749,8 @@ def _draw_summary_sheet(summary_axis, report: AxisReport) -> None:
         ("Cpu / Cpl", f"{format_metric(report.cpu, 3)} / {format_metric(report.cpl, 3)}"),
         ("Pp / Ppk", f"{format_metric(report.pp, 3)} / {format_metric(report.ppk, 3)}"),
         ("Ppu / Ppl", f"{format_metric(report.ppu, 3)} / {format_metric(report.ppl, 3)}"),
-        ("Predicted OOS", f"{report.predicted_oos_ppm:.1f} ppm"),
-        ("Expected Yield", f"{report.expected_yield_percent:.3f}%"),
+        ("Predicted OOS", format_ppm(report.predicted_oos_ppm) + " ppm"),
+        ("Expected Yield", format_metric(report.expected_yield_percent, 3, unit="%")),
     ]
     if report.observed_oos_count > 0:
         right_metrics.insert(
@@ -1222,7 +773,7 @@ def _draw_summary_sheet(summary_axis, report: AxisReport) -> None:
     summary_axis.text(
         0.06,
         0.205,
-        f"Target: {format_metric(spec.resolved_target)}",
+        f"Target: {spec.target if spec.target is not None else 'Not set'}",
         transform=summary_axis.transAxes,
         fontsize=11.2,
         color=INK,
@@ -1232,8 +783,9 @@ def _draw_summary_sheet(summary_axis, report: AxisReport) -> None:
         0.52,
         0.24,
         (
-            "Judgement: "
-            f"{'Meets requirement' if report.status == 'PASS' else 'Requires attention'}"
+            "Judgement: " +
+            ("No measurable variation" if report.within_std == 0 else
+             "Meets requirement" if report.status == "PASS" else "Requires attention")
         ),
         transform=summary_axis.transAxes,
         fontsize=11.2,
@@ -1338,8 +890,232 @@ def _style_plot_axis(axis) -> None:
         spine.set_color("#D9E0E7")
         spine.set_linewidth(1.0)
 
+class _CapabilityPDF:
+    margin = 36
+    width = PAGE_WIDTH - 2 * margin
 
-def _clip_text(text: str, max_chars: int) -> str:
-    if len(text) <= max_chars:
-        return text
-    return textwrap.shorten(text, width=max_chars, placeholder="...")
+    def __init__(self, pdf: canvas.Canvas, metadata: ReportMetadata, page_count: int):
+        self.pdf = pdf
+        self.metadata = metadata
+        self.page_count = page_count
+        self.regular, self.bold = _register_fonts()
+
+    def text(self, x, y, value, size=11, *, bold=False, color=INK, right=False, width=None):
+        value = str(value)
+        font = self.bold if bold else self.regular
+        if width is not None:
+            length = pdfmetrics.stringWidth(value, font, size)
+            if length > width:
+                size *= width / length
+        self.pdf.setFont(font, size)
+        self.pdf.setFillColor(HexColor(color))
+        draw = self.pdf.drawRightString if right else self.pdf.drawString
+        draw(x, y, value)
+
+    def box(self, x, y, width, height, color):
+        self.pdf.setFillColor(HexColor(color))
+        self.pdf.rect(x, y, width, height, fill=1, stroke=0)
+
+    def header(self, title, subtitle):
+        key = f"page-{self.pdf.getPageNumber()}"
+        self.pdf.bookmarkPage(key)
+        self.pdf.addOutlineEntry(title, key)
+        self.text(36, 560, "QUALITY ENGINEERING   /   REPEATABILITY", 10, bold=True, color=ACCENT)
+        self.text(PAGE_WIDTH - 36, 560, self.metadata.report_date, 10, right=True, width=280)
+        self.text(36, 519, title, 28, bold=True, width=self.width)
+        self.text(36, 496, subtitle, 11, color=MUTED, width=self.width)
+        self.box(36, 482, self.width, 0.6, "#CCDAD9")
+
+    def finish(self):
+        self.box(36, 34, self.width, 0.6, "#CCDAD9")
+        machine = "   /   ".join(filter(None, (self.metadata.machine_model, self.metadata.serial_number)))
+        self.text(36, 17, machine, 9, color=MUTED, width=self.width - 80)
+        self.text(PAGE_WIDTH - 36, 17, f"{self.pdf.getPageNumber()} / {self.page_count}", 9, right=True)
+        self.pdf.showPage()
+
+    def table(self, x, top, width, headers, rows, fractions, row_height=24):
+        def draw_row(values, y, header):
+            left = x
+            for i, (value, fraction) in enumerate(zip(values, fractions)):
+                cell = width * fraction
+                right = i > 0
+                self.text(left + cell - 7 if right else left + 7, y + 7, value, 10.5,
+                          bold=header or i == 0, color=PANEL if header else INK,
+                          right=right, width=cell - 14)
+                left += cell
+
+        y = top - row_height
+        self.box(x, y, width, row_height, "#244558")
+        draw_row(headers, y, True)
+        for i, row in enumerate(rows):
+            y -= row_height
+            if i % 2 == 0:
+                self.box(x, y, width, row_height, "#F0F5F5")
+            draw_row(row, y, False)
+
+    def overview(self, all_reports, page_reports, first, notes):
+        meta = self.metadata
+        result = overall_result(all_reports)
+        title = meta.report_title or "Machine repeatability study"
+        self.header(title if first else "Axis summary (continued)",
+                    f"{len(all_reports)} axes   /   {all_reports[0].sample_count} measurements per axis   /   Millimetres")
+        labels = {"PASS": "All axes meet the study criteria", "FAIL": "One or more axes failed",
+                  "N/A": "Capability could not be assessed for all axes"}
+        self.box(36, 389, self.width, 71, "#F0F5F5")
+        self.text(50, 431, f"{result}   /   {labels[result]}", 19, bold=True, color=STATUS_COLORS[result])
+        defined = [report for report in all_reports if math.isfinite(report.cpk)]
+        outside = sum(report.observed_oos_count for report in all_reports)
+        trials = sum(report.sample_count for report in all_reports)
+        reason = f"Outside specification: {outside} of {trials} readings."
+        if defined:
+            lowest = min(defined, key=lambda report: report.cpk)
+            reason += f" Lowest measured Cpk: {format_metric(lowest.cpk, 3)} on axis {lowest.spec.axis_name}."
+        if len(defined) < len(all_reports):
+            reason += " N/A indicates no measurable variation."
+        self.text(50, 406, reason, width=self.width - 28)
+        self.text(36, 361, "Acceptance criteria", 13, bold=True)
+        self.text(36, 341, "Each unrounded Cpk must meet its required value, with all readings inside or on the specification limits.")
+        rows = []
+        for r in page_reports:
+            rows.append((r.spec.axis_name, r.sample_count, format_metric(r.mean, 5),
+                         str(r.spec.cpk_requirement), format_metric(r.cpk, 3), format_metric(r.ppk, 3),
+                         format_metric(r.cpm, 3), f"{r.observed_oos_count} / {r.sample_count}", r.status))
+        self.table(36, 319, self.width,
+                   ("Axis", "N", "Mean (mm)", "Required Cpk", "Cpk", "Ppk", "Cpm", "Outside spec", "Result"),
+                   rows, (.16, .05, .15, .14, .09, .09, .09, .13, .10))
+        self.text(36, 177, "Study details", 13, bold=True)
+        left = (("Customer", meta.customer_name), ("Machine", meta.machine_name),
+                ("Model", meta.machine_model), ("Serial number", meta.serial_number))
+        right = (("Part", meta.part_name), ("Measurement tool", meta.measurement_tool_name),
+                 ("Tool model", meta.measurement_tool_model), ("Inspector", meta.inspected_by))
+        for x, details in ((36, left), (422, right)):
+            for i, (label, value) in enumerate(details):
+                self.text(x, 157 - 17*i, label, 10, color=MUTED)
+                self.text(x + 98, 157 - 17*i, value or "-", 10, width=270)
+        if notes:
+            self.text(36, 83, "Notes", 11, bold=True)
+            for i, note in enumerate(notes):
+                self.text(36, 66 - 14*i, note, 10, width=self.width)
+        self.finish()
+
+    def metric_list(self, x, right, title, items):
+        self.text(x, 458, title, 13, bold=True, color=ACCENT)
+        for i, (label, value) in enumerate(items):
+            y = 433 - 20*i
+            self.text(x, y, label, 10)
+            self.text(right, y, value, 10, bold=True, right=True, width=right-x-65)
+
+    def chart(self, report, plotter, x, y, width, height):
+        fig = Figure(figsize=(width/63, height/63), layout="constrained", facecolor=PANEL)
+        axis = fig.subplots()
+        plotter(axis, report)
+        axis.set_title("")
+        axis.tick_params(labelsize=9)
+        axis.xaxis.label.set_size(10)
+        axis.yaxis.label.set_size(10)
+        axis.ticklabel_format(useOffset=False)
+        axis.legend(loc="best", fontsize=8)
+        image = ImageReader(BytesIO(figure_to_png_bytes(fig)))
+        self.pdf.drawImage(image, x, y, width, height)
+
+    def capability(self, r):
+        spec = r.spec
+        details = (f"{r.status}   |   Required Cpk {spec.cpk_requirement}   |   Actual Cpk {format_metric(r.cpk, 3)}"
+                   f"   |   {r.observed_oos_count} of {r.sample_count} outside specification")
+        self.header(f"Axis {spec.axis_name}   /   Capability summary", details)
+        self.metric_list(36, 187, "Process data (mm)", [
+            ("LSL", str(spec.lsl)), ("Target", str(spec.target) if spec.target is not None else "Not set"),
+            ("USL", str(spec.usl)), ("Sample mean", format_metric(r.mean, 5)),
+            ("Within StDev", format_metric(r.within_std, 5)), ("Overall StDev", format_metric(r.overall_std, 5)),
+            ("Minimum", str(r.minimum)), ("Maximum", str(r.maximum)),
+        ])
+        self.text(208, 458, "Capability histogram", 13, bold=True, color=ACCENT)
+        self.chart(r, _plot_histogram_panel, 198, 248, 397, 200)
+        self.metric_list(612, PAGE_WIDTH-36, "Capability indices", [
+            ("Cp", format_metric(r.cp, 3)), ("CPL / CPU", f"{format_metric(r.cpl, 3)} / {format_metric(r.cpu, 3)}"),
+            ("Cpk", format_metric(r.cpk, 3)), ("Pp", format_metric(r.pp, 3)),
+            ("PPL / PPU", f"{format_metric(r.ppl, 3)} / {format_metric(r.ppu, 3)}"),
+            ("Ppk", format_metric(r.ppk, 3)), ("Cpm", format_metric(r.cpm, 3)),
+        ])
+        self.box(36, 245, self.width, .6, "#CCDAD9")
+        self.text(36, 222, "Performance in parts per million (PPM)", 14, bold=True)
+        self.table(36, 208, self.width, ("Position", "Observed", "Expected overall", "Expected within"),
+                   _performance_rows(r), (.30, .20, .25, .25), 23)
+        self.text(36, 94, f"Observed PPM uses {r.sample_count} readings. Expected PPM assumes a normal distribution. Positive estimates below 0.001 PPM appear as < 0.001.", 10, width=self.width)
+        self.text(36, 74, "Within StDev = mean moving range / 1.128. Overall StDev = sample standard deviation (n - 1).", 9, color=MUTED)
+        self.text(36, 55, "Cpm = (USL - LSL) / [6 x sqrt(overall variance + (mean - target) squared)]. Cpm requires a target and measurable variation.", 9, color=MUTED)
+        self.finish()
+
+    def diagnostics(self, r):
+        self.header(f"Axis {r.spec.axis_name}   /   Diagnostic charts",
+                    "Measurement sequence, normal-model fit and estimated spread relative to the specification limits.")
+        for x, title, plotter in [(36, "Run chart", _plot_run_chart_panel),
+                                  (433, "Normal probability plot", _plot_probability_panel)]:
+            self.text(x, 458, title, 14, bold=True, color=ACCENT)
+            self.chart(r, plotter, x, 206, 370, 235)
+        self.box(36, 192, self.width, .6, "#CCDAD9")
+        self.text(36, 168, "Process spread vs. specification", 14, bold=True)
+        fig = Figure(figsize=(10.9, 1.45), layout="constrained", facecolor=PANEL)
+        ax = fig.subplots()
+        ax.axvspan(r.spec.lsl, r.spec.usl, color="#EAF5F2")
+        for limit in (r.spec.lsl, r.spec.usl):
+            ax.axvline(limit, color=SPEC, linewidth=1.1)
+        if r.spec.target is not None:
+            ax.axvline(r.spec.target, color=TARGET, linestyle=":")
+        for y, sigma, color in [(1, r.overall_std, OVERALL), (0, r.within_std, WITHIN)]:
+            _plot_sigma_span(ax, r.mean, sigma, y, color)
+            ax.scatter([r.mean], [y], color=color, s=18)
+        ax.set_yticks([0,1], ["Within", "Overall"])
+        ax.set_ylim(-.6,1.6)
+        ax.ticklabel_format(axis="x", useOffset=False)
+        self.pdf.drawImage(ImageReader(BytesIO(figure_to_png_bytes(fig))), 38, 67, self.width-4, 93)
+        self.text(36, 49, "Each bar spans the mean plus or minus three standard deviations. The centre dot marks the sample mean. Measurements in mm.", 10, color=MUTED)
+        self.finish()
+
+    def measurements(self, group):
+        self.header("Measurement data", "Readings in acquisition order. One row per trial; all dimensions in millimetres.")
+        headers = ["Trial", *(r.spec.axis_name + " (mm)" for r in group)]
+        fractions = [.15] + [.85 / len(group)] * len(group)
+        for start, x in ((0, 36), (15, 431)):
+            rows = [(i+1, *(str(r.values[i]) for r in group)) for i in range(start, start + 15)]
+            self.table(x, 457, 374, headers, rows, fractions)
+        self.text(36, 52, "The values shown here were used to calculate the capability and performance results.", 10, color=MUTED)
+        self.finish()
+
+
+def export_pdf(metadata: ReportMetadata, reports: list[AxisReport], output_path: str | Path) -> Path:
+    if not reports:
+        raise ValueError("At least one axis is required to export a report.")
+    destination = Path(output_path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    regular, _ = _register_fonts()
+    notes = simpleSplit(metadata.notes.strip(), regular, 10, _CapabilityPDF.width) if metadata.notes.strip() else []
+    overflow_notes = [notes[i:i+25] for i in range(2, len(notes), 25)]
+    overview_groups = [reports[i:i+4] for i in range(0, len(reports), 4)]
+    measurement_groups = [reports[i:i+3] for i in range(0, len(reports), 3)]
+    page_count = len(overview_groups) + 2*len(reports) + len(measurement_groups) + len(overflow_notes)
+
+    # Finish the new document before replacing an existing customer report.
+    with NamedTemporaryFile(dir=destination.parent, suffix=".pdf", delete=False) as staged:
+        staged_path = Path(staged.name)
+    try:
+        pdf = canvas.Canvas(str(staged_path), pagesize=PAGE_SIZE)
+        pdf.setTitle(metadata.report_title or "Machine repeatability study")
+        writer = _CapabilityPDF(pdf, metadata, page_count)
+        for i, group in enumerate(overview_groups):
+            writer.overview(reports, group, i == 0, notes[:2] if i == 0 else [])
+        for lines in overflow_notes:
+            writer.header("Study notes", metadata.report_title)
+            for i, note in enumerate(lines):
+                writer.text(36, 458 - i*16, note, 10, width=writer.width)
+            writer.finish()
+        for report in reports:
+            writer.capability(report)
+            writer.diagnostics(report)
+        for group in measurement_groups:
+            writer.measurements(group)
+        pdf.save()
+        staged_path.replace(destination)
+    finally:
+        staged_path.unlink(missing_ok=True)
+    return destination

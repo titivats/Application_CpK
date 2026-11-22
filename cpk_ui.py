@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+from contextlib import closing
 from datetime import date
-from io import BytesIO
+from functools import partial
+import math
 from pathlib import Path
 import random
 import re
@@ -9,8 +11,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
 from openpyxl import load_workbook
-from openpyxl.utils.cell import range_boundaries
-from PIL import Image
+from openpyxl.utils.cell import get_column_letter, range_boundaries
 
 from cpk_desktop.axes import (
     DEFAULT_AXIS_NAMES,
@@ -24,10 +25,10 @@ from cpk_desktop.widgets import PreviewImagePanel, ScrollablePanel
 from cpk_reporting import (
     create_capability_histogram_figure,
     create_capability_summary_figure,
+    create_performance_figure,
     create_normal_probability_figure,
     create_run_chart_figure,
     export_pdf,
-    figure_to_png_bytes,
 )
 from cpk_tool.analysis import (
     AxisSpec,
@@ -35,8 +36,10 @@ from cpk_tool.analysis import (
     ReportMetadata,
     calculate_axis_report,
     format_metric,
+    overall_result,
     parse_measurement_values,
 )
+from cpk_tool.excel_template import MEASUREMENTS, SPECIFICATIONS, read_excel_template, save_excel_template
 
 
 APP_BG = "#EEF3F7"
@@ -61,7 +64,6 @@ FULL_HD_WIDTH = 1920
 FULL_HD_HEIGHT = 1080
 FULL_HD_WINDOW_WIDTH = 1840
 FULL_HD_WINDOW_HEIGHT = 980
-PREVIEW_RENDER_DPI = 110
 PREVIEW_CHART_FIGURE_SIZE = (11.4, 6.7)
 PREVIEW_SUMMARY_FIGURE_SIZE = (11.8, 7.2)
 PREVIEW_TABS = (
@@ -69,6 +71,7 @@ PREVIEW_TABS = (
     ("probability", "Normal Probability Plot"),
     ("run_chart", "Run Chart"),
     ("summary", "Capability Summary"),
+    ("performance", "PPM / Cpm"),
 )
 
 
@@ -82,6 +85,7 @@ class AxisInputFrame(ttk.Frame):
         *,
         on_request_rename,
         on_request_remove,
+        on_inputs_changed,
     ) -> None:
         super().__init__(master, padding=14, style="Surface.TFrame")
         self.axis_key = axis_key
@@ -89,6 +93,7 @@ class AxisInputFrame(ttk.Frame):
         self.accent_color = accent_color
         self._on_request_rename = on_request_rename
         self._on_request_remove = on_request_remove
+        self._on_inputs_changed = on_inputs_changed
         self.lsl_var = tk.StringVar()
         self.target_var = tk.StringVar()
         self.usl_var = tk.StringVar()
@@ -113,9 +118,6 @@ class AxisInputFrame(ttk.Frame):
         self._pending_report_token: tuple[object, ...] | None = None
         self._rendered_report_token: tuple[object, ...] | None = None
         self._rendered_preview_tabs: set[str] = set()
-        self._cached_workbook = None
-        self._cached_workbook_path = ""
-        self._cached_workbook_mtime_ns = 0
         self._hero_title_var = tk.StringVar()
         self._preview_title_var = tk.StringVar()
         self._axis_badge_var = tk.StringVar()
@@ -123,28 +125,44 @@ class AxisInputFrame(ttk.Frame):
 
         self._sync_axis_labels()
         self._build_layout()
+        for variable in (self.lsl_var, self.usl_var, self.target_var, self.cpk_requirement_var, *self.value_vars):
+            variable.trace_add("write", self._measurement_changed)
+
+    def _measurement_changed(self, *_args) -> None:
+        if self._pending_report is None:
+            return
+        self._pending_report = None
+        self._pending_report_token = None
+        self._set_axis_status("Recalculate", GOLD_SOFT, PENDING)
+        message = "Inputs changed. Click Calculate Preview to refresh results."
+        self.axis_meta_var.set(message)
+        self._show_placeholder(message)
+        self._on_inputs_changed(message)
+
 
 
     def _build_layout(self) -> None:
         self.columnconfigure(0, weight=1)
         self.rowconfigure(0, weight=1)
 
-        page_scroll = ScrollablePanel(self, background=SURFACE)
-        page_scroll.grid(row=0, column=0, sticky="nsew")
-        page_scroll.content.columnconfigure(0, weight=1)
-        page_scroll.content.rowconfigure(0, weight=1)
-
-        paned = ttk.Panedwindow(page_scroll.content, orient="horizontal")
+        paned = ttk.Panedwindow(self, orient="horizontal")
         paned.grid(row=0, column=0, sticky="nsew")
 
-        input_column = ttk.Frame(paned, style="Surface.TFrame")
-        preview_column = ttk.Frame(paned, style="Surface.TFrame")
+        input_scroll = ScrollablePanel(paned, background=SURFACE)
+        input_column = input_scroll.content
         input_column.columnconfigure(0, weight=1)
+        preview_column = ttk.Frame(paned, style="Surface.TFrame")
         preview_column.columnconfigure(0, weight=1)
         preview_column.rowconfigure(0, weight=1)
-        paned.add(input_column, weight=0)
+        paned.add(input_scroll, weight=0)
         paned.add(preview_column, weight=1)
-        self.after(120, lambda: paned.sashpos(0, 600))
+
+        # Set the starting split once the tab has a real width; keep later user adjustments.
+        def position_sash(_event):
+            if paned.winfo_width() > 1:
+                paned.sashpos(0, min(600, int(paned.winfo_width() * 0.36)))
+                paned.unbind("<Configure>", sash_binding)
+        sash_binding = paned.bind("<Configure>", position_sash)
 
         hero_card = self._build_axis_hero(input_column)
         hero_card.grid(row=0, column=0, sticky="ew", pady=(0, 14))
@@ -154,9 +172,9 @@ class AxisInputFrame(ttk.Frame):
         for column in range(2):
             self.spec_frame.columnconfigure(column, weight=1)
 
-        self._add_labeled_entry(self.spec_frame, "LSL", self.lsl_var, 0, 0)
-        self._add_labeled_entry(self.spec_frame, "Target", self.target_var, 0, 1)
-        self._add_labeled_entry(self.spec_frame, "USL", self.usl_var, 1, 0)
+        self._add_labeled_entry(self.spec_frame, "LSL (mm)", self.lsl_var, 0, 0)
+        self._add_labeled_entry(self.spec_frame, "Target (mm)", self.target_var, 0, 1)
+        self._add_labeled_entry(self.spec_frame, "USL (mm)", self.usl_var, 1, 0)
         self._add_labeled_entry(self.spec_frame, "Required Cpk", self.cpk_requirement_var, 1, 1)
 
         source_frame = ttk.LabelFrame(input_column, text="Measurement Source")
@@ -283,7 +301,7 @@ class AxisInputFrame(ttk.Frame):
         preview_frame = ttk.LabelFrame(preview_column, text="Capability Preview")
         preview_frame.grid(row=0, column=0, sticky="nsew")
         preview_frame.columnconfigure(0, weight=1)
-        preview_frame.rowconfigure(2, weight=1)
+        preview_frame.rowconfigure(1, weight=1)
 
         preview_hero = tk.Frame(
             preview_frame,
@@ -321,14 +339,8 @@ class AxisInputFrame(ttk.Frame):
         )
         self.status_pill.grid(row=0, column=1, rowspan=2, sticky="e", padx=(16, 0))
 
-        ttk.Label(
-            preview_frame,
-            text="Each tab mirrors one export section. Use the scroll bars if a chart needs extra space.",
-            style="Muted.TLabel",
-        ).grid(row=1, column=0, sticky="w", padx=12, pady=(10, 0))
-
-        self.preview_notebook = ttk.Notebook(preview_frame, takefocus=False)
-        self.preview_notebook.grid(row=2, column=0, sticky="nsew", padx=8, pady=8)
+        self.preview_notebook = ttk.Notebook(preview_frame, takefocus=False, style="Preview.TNotebook")
+        self.preview_notebook.grid(row=1, column=0, sticky="nsew", padx=8, pady=8)
         self.preview_notebook.bind("<<NotebookTabChanged>>", self._handle_preview_tab_change)
         for tab_key, tab_title in PREVIEW_TABS:
             tab_frame = ttk.Frame(self.preview_notebook, style="Surface.TFrame")
@@ -465,18 +477,12 @@ class AxisInputFrame(ttk.Frame):
     def build_report(self):
         lsl = self._parse_float(self.lsl_var.get(), "LSL")
         usl = self._parse_float(self.usl_var.get(), "USL")
-        if usl <= lsl:
-            raise ValueError(f"Axis {self.axis_name}: USL must be greater than LSL.")
 
         target_text = self.target_var.get().strip()
         target = self._parse_float(target_text, "Target") if target_text else None
-        if target is not None and not (lsl <= target <= usl):
-            raise ValueError(f"Axis {self.axis_name}: Target must be between LSL and USL.")
 
         requirement_text = self.cpk_requirement_var.get().strip()
         cpk_requirement = self._parse_float(requirement_text, "Required Cpk") if requirement_text else 1.33
-        if cpk_requirement < 0:
-            raise ValueError(f"Axis {self.axis_name}: Required Cpk must be non-negative.")
 
         values = parse_measurement_values([variable.get() for variable in self.value_vars], self.axis_name)
         spec = AxisSpec(
@@ -505,11 +511,15 @@ class AxisInputFrame(ttk.Frame):
             f"Mean {format_metric(report.mean)}",
             f"Cpk {format_metric(report.cpk, 3)}",
         ]
+        if report.within_std == 0:
+            meta_parts.append("No measurable variation")
         if report.observed_oos_count > 0:
             meta_parts.append(f"Observed OOS {report.observed_oos_count}")
         self.axis_meta_var.set(" | ".join(meta_parts))
         if report.status == "PASS":
             self._set_axis_status("PASS", "#DFF4E8", PASS)
+        elif report.status == "N/A":
+            self._set_axis_status("N/A", GOLD_SOFT, PENDING)
         else:
             self._set_axis_status("FAIL", "#FBE7E4", FAIL)
         self._pending_report = report
@@ -529,29 +539,24 @@ class AxisInputFrame(ttk.Frame):
             self._rendered_preview_tabs.clear()
 
         selected_tab_key = self._selected_preview_tab_key()
-        if selected_tab_key is None or selected_tab_key in self._rendered_preview_tabs:
+        if selected_tab_key is None:
+            return
+        view = self.preview_views[selected_tab_key]
+        if selected_tab_key in self._rendered_preview_tabs:
+            view.refresh()
             return
 
         figure_factories = {
-            "histogram": lambda report: create_capability_histogram_figure(
-                report,
-                figure_size=PREVIEW_CHART_FIGURE_SIZE,
-            ),
-            "probability": lambda report: create_normal_probability_figure(
-                report,
-                figure_size=PREVIEW_CHART_FIGURE_SIZE,
-            ),
-            "run_chart": lambda report: create_run_chart_figure(
-                report,
-                figure_size=PREVIEW_CHART_FIGURE_SIZE,
-            ),
-            "summary": lambda report: create_capability_summary_figure(
-                report,
-                figure_size=PREVIEW_SUMMARY_FIGURE_SIZE,
-            ),
+            "histogram": create_capability_histogram_figure,
+            "probability": create_normal_probability_figure,
+            "run_chart": create_run_chart_figure,
+            "performance": create_performance_figure,
+            "summary": create_capability_summary_figure,
         }
-        preview_image = self._render_preview_image(figure_factories[selected_tab_key](self._pending_report))
-        self.preview_views[selected_tab_key].set_image(preview_image)
+        figure_size = (PREVIEW_SUMMARY_FIGURE_SIZE if selected_tab_key in ("performance", "summary")
+                       else PREVIEW_CHART_FIGURE_SIZE)
+        factory = partial(figure_factories[selected_tab_key], self._pending_report, figure_size=figure_size)
+        view.set_figure(factory, figure_size)
         self._rendered_preview_tabs.add(selected_tab_key)
 
 
@@ -567,14 +572,13 @@ class AxisInputFrame(ttk.Frame):
         if not selected:
             return
 
-        self.excel_path_var.set(selected)
         try:
             self._refresh_excel_sheets(selected)
         except ValueError as exc:
             messagebox.showerror("Excel import error", str(exc))
-            self.excel_path_var.set("")
             return
 
+        self.excel_path_var.set(selected)
         self.excel_source_note_var.set(
             f"Workbook loaded for Axis {self.axis_name}. Choose a sheet and range, then load 30 values."
         )
@@ -601,7 +605,6 @@ class AxisInputFrame(ttk.Frame):
 
 
     def clear_axis(self) -> None:
-        self._close_cached_workbook()
         self._pending_report = None
         self._pending_report_token = None
         self._rendered_report_token = None
@@ -648,8 +651,19 @@ class AxisInputFrame(ttk.Frame):
 
     def _refresh_excel_sheets(self, workbook_path: str) -> None:
         try:
-            workbook = self._get_cached_workbook(workbook_path)
-            sheet_names = list(workbook.sheetnames)
+            with closing(load_workbook(workbook_path, read_only=True, data_only=True)) as workbook:
+                sheet_names = [sheet.title for sheet in workbook.worksheets]
+                selected_sheet = sheet_names[0] if sheet_names else None
+                if MEASUREMENTS in sheet_names and SPECIFICATIONS in sheet_names:
+                    header = next(workbook[MEASUREMENTS].values, ())
+                    if header and header[0] == "Trial":
+                        matches = [col for col, name in enumerate(header[1:], 2)
+                                   if isinstance(name, str) and name.strip().casefold() == self.axis_name.casefold()]
+                        if len(matches) != 1:
+                            raise ValueError(f"Expected one measurement column for Axis {self.axis_name}.")
+                        letter = get_column_letter(matches[0])
+                        self.excel_range_var.set(f"{letter}2:{letter}{EXPECTED_SAMPLE_COUNT + 1}")
+                        selected_sheet = MEASUREMENTS
         except Exception as exc:
             raise ValueError(f"Axis {self.axis_name}: could not open the Excel workbook. {exc}") from exc
 
@@ -658,7 +672,7 @@ class AxisInputFrame(ttk.Frame):
 
         if self.sheet_selector is not None:
             self.sheet_selector.configure(values=sheet_names)
-        self.excel_sheet_var.set(sheet_names[0])
+        self.excel_sheet_var.set(selected_sheet)
 
 
     def _query_excel_range(self) -> tuple[list[float], str]:
@@ -683,19 +697,16 @@ class AxisInputFrame(ttk.Frame):
         values: list[float] = []
         try:
             min_col, min_row, max_col, max_row = range_boundaries(range_ref)
-            workbook = self._get_cached_workbook(workbook_path)
-            worksheet = workbook[sheet_name]
-            for row in worksheet.iter_rows(
-                min_row=min_row,
-                max_row=max_row,
-                min_col=min_col,
-                max_col=max_col,
-                values_only=True,
-            ):
-                for value in row:
-                    number = self._coerce_excel_value(value)
-                    if number is not None:
-                        values.append(number)
+            with closing(load_workbook(workbook_path, read_only=True, data_only=True)) as workbook:
+                worksheet = workbook[sheet_name]
+                for row in worksheet.iter_rows(min_row=min_row, max_row=max_row,
+                                               min_col=min_col, max_col=max_col, values_only=True):
+                    for value in row:
+                        number = self._coerce_excel_value(value)
+                        if number is not None:
+                            if not math.isfinite(number):
+                                raise ValueError(f"Measurement #{len(values) + 1} must be finite.")
+                            values.append(number)
         except KeyError as exc:
             raise ValueError(f"Axis {self.axis_name}: sheet '{sheet_name}' was not found in the workbook.") from exc
         except Exception as exc:
@@ -716,65 +727,37 @@ class AxisInputFrame(ttk.Frame):
         return values, source_note
 
 
-    def close_resources(self) -> None:
-        self._close_cached_workbook()
-
-
-    def destroy(self) -> None:
-        self._close_cached_workbook()
-        super().destroy()
-
-
-    def _close_cached_workbook(self) -> None:
-        if self._cached_workbook is not None:
-            try:
-                self._cached_workbook.close()
-            except Exception:
-                pass
-        self._cached_workbook = None
-        self._cached_workbook_path = ""
-        self._cached_workbook_mtime_ns = 0
-
-
-    def _get_cached_workbook(self, workbook_path: str):
-        resolved_path = str(Path(workbook_path).resolve())
-        mtime_ns = Path(resolved_path).stat().st_mtime_ns
-        if (
-            self._cached_workbook is None
-            or self._cached_workbook_path != resolved_path
-            or self._cached_workbook_mtime_ns != mtime_ns
-        ):
-            self._close_cached_workbook()
-            self._cached_workbook = load_workbook(resolved_path, read_only=True, data_only=True)
-            self._cached_workbook_path = resolved_path
-            self._cached_workbook_mtime_ns = mtime_ns
-        return self._cached_workbook
+    def apply_template_column(self, path: Path, column: int, values: list[float], spec: AxisSpec | None) -> None:
+        self._populate_measurements(values)
+        if spec is not None:
+            self.lsl_var.set(str(spec.lsl))
+            self.target_var.set("" if spec.target is None else str(spec.target))
+            self.usl_var.set(str(spec.usl))
+            self.cpk_requirement_var.set(str(spec.cpk_requirement))
+        letter = get_column_letter(column)
+        cell_range = f"{letter}2:{letter}{EXPECTED_SAMPLE_COUNT + 1}"
+        self.excel_path_var.set(str(path))
+        self.sheet_selector.configure(values=(MEASUREMENTS,))
+        self.excel_sheet_var.set(MEASUREMENTS)
+        self.excel_range_var.set(cell_range)
+        self.excel_source_note_var.set(f"Loaded {path.name} | {MEASUREMENTS}!{cell_range}")
+        self.axis_meta_var.set(f"{len(values)} measurements imported | {self.axis_name}")
+        self._set_axis_status("Data Loaded", "#E4F5F1", ACCENT)
 
 
     def _populate_measurements(self, values: list[float]) -> None:
         for variable, value in zip(self.value_vars, values):
-            variable.set(_format_input_value(value))
-
-
-    def _clear_preview(self) -> None:
-        self._rendered_report_token = None
-        self._rendered_preview_tabs.clear()
-        for preview_view in self.preview_views.values():
-            preview_view.clear()
-
-
-    def _render_preview_image(self, figure) -> Image.Image:
-        image_bytes = figure_to_png_bytes(figure, dpi=PREVIEW_RENDER_DPI)
-        with Image.open(BytesIO(image_bytes)) as rendered:
-            return rendered.convert("RGBA").copy()
+            variable.set(str(value))
 
 
     def _show_placeholder(self, text: str) -> None:
-        self._clear_preview()
+        self._rendered_report_token = None
+        self._rendered_preview_tabs.clear()
         descriptions = {
             "histogram": text,
             "probability": "Normal Probability Plot preview will appear after calculation.",
             "run_chart": "Run Chart preview will appear after calculation.",
+            "performance": "PPM and Cpm will appear after calculation.",
             "summary": "Capability Summary preview will appear after calculation.",
         }
         for tab_key, preview_view in self.preview_views.items():
@@ -811,7 +794,9 @@ class AxisInputFrame(ttk.Frame):
         if isinstance(value, (int, float)):
             return float(value)
         if isinstance(value, str):
-            cleaned = value.strip().replace(",", "")
+            cleaned = value.strip()
+            if "," in cleaned and re.fullmatch(r"[+\-\d.,eE\s]+", cleaned):
+                raise ValueError(f"Ambiguous number '{cleaned}'. Use a numeric Excel cell or decimal-point text.")
             if not cleaned:
                 return None
             try:
@@ -850,11 +835,10 @@ class CpkReporterApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title("Machine Cpk Capability Reporter")
-        self.minsize(1440, 860)
+        self.minsize(min(1080, self.winfo_screenwidth() - 32), min(640, self.winfo_screenheight() - 96))
         self.configure(bg=APP_BG)
         self._app_icon_image: tk.PhotoImage | None = None
         self._apply_app_icon()
-        self.protocol("WM_DELETE_WINDOW", self._on_close)
 
         self.report_title_var = tk.StringVar(value="Machine Repeatability Cpk Report")
         self.customer_var = tk.StringVar()
@@ -891,8 +875,8 @@ class CpkReporterApp(tk.Tk):
             target_width = FULL_HD_WINDOW_WIDTH
             target_height = FULL_HD_WINDOW_HEIGHT
         else:
-            target_width = max(1360, min(FULL_HD_WINDOW_WIDTH, screen_width - 40))
-            target_height = max(820, min(FULL_HD_WINDOW_HEIGHT, screen_height - 80))
+            target_width = min(FULL_HD_WINDOW_WIDTH, screen_width - 40)
+            target_height = min(FULL_HD_WINDOW_HEIGHT, screen_height - 96)
 
         x_position = max(0, (screen_width - target_width) // 2)
         y_position = max(0, (screen_height - target_height) // 2)
@@ -900,10 +884,7 @@ class CpkReporterApp(tk.Tk):
 
 
     def _apply_app_icon(self) -> None:
-        icon_path = get_first_existing_asset_path(
-            ("assets", "program_source.ico"),
-            ("assets", "machine_cpk_reporter.ico"),
-        )
+        icon_path = get_first_existing_asset_path(("assets", "program_source.ico"))
         if icon_path is not None:
             try:
                 self.iconbitmap(default=str(icon_path))
@@ -912,10 +893,8 @@ class CpkReporterApp(tk.Tk):
                 pass
 
         png_path = get_first_existing_asset_path(
-            ("Icon", "Program.png"),
-            ("Icon", "program.png"),
+            ("assets", "source", "Program.png"),
             ("assets", "program_source_256.png"),
-            ("assets", "machine_cpk_reporter_256.png"),
         )
         if png_path is not None:
             try:
@@ -1001,6 +980,9 @@ class CpkReporterApp(tk.Tk):
             padding=[("selected", (18, 10))],
             expand=[("selected", (0, 0, 0, 0))],
         )
+        style.configure("Preview.TNotebook.Tab", padding=(7, 6))
+        style.map("Preview.TNotebook.Tab", padding=[("selected", (7, 6))])
+
         style.configure(
             "TButton",
             padding=(12, 8),
@@ -1107,89 +1089,26 @@ class CpkReporterApp(tk.Tk):
         self.columnconfigure(0, weight=1)
         self.rowconfigure(1, weight=1)
 
-        header = tk.Frame(self, bg=HEADER_BG, padx=22, pady=16)
+        header = tk.Frame(self, bg=HEADER_BG, padx=16, pady=8)
         header.grid(row=0, column=0, sticky="ew")
         header.columnconfigure(0, weight=1)
-
-        tk.Frame(header, bg=HEADER_TOP, height=4).grid(row=0, column=0, columnspan=2, sticky="new", pady=(0, 14))
-
         tk.Label(
-            header,
-            text="Machine Cpk Capability Reporter",
-            bg=HEADER_BG,
-            fg="#FFFFFF",
-            font=("Segoe UI Semibold", 23),
-        ).grid(row=1, column=0, sticky="w")
-        tk.Label(
-            header,
-            text="Desktop capability analysis for multi-axis repeatability, Excel-assisted data import, and customer-ready PDF export.",
-            bg=HEADER_BG,
-            fg=HEADER_SOFT,
-            font=("Segoe UI", 10),
-        ).grid(row=2, column=0, sticky="w", pady=(5, 0))
+            header, text="Machine Cpk Capability Reporter", bg=HEADER_BG,
+            fg="#FFFFFF", font=("Segoe UI Semibold", 16),
+        ).grid(row=0, column=0, sticky="w")
 
-        badge_row = tk.Frame(header, bg=HEADER_BG)
-        badge_row.grid(row=3, column=0, sticky="w", pady=(12, 0))
-        self._build_header_badge(badge_row, "Audit-Ready Desktop", GOLD, "#102A43").pack(side="left")
-        self._build_header_badge(badge_row, "Dynamic Axis Tabs", "#1F4F6E", "#FFFFFF").pack(side="left", padx=(8, 0))
-        self._build_header_badge(badge_row, "Excel Query + PDF Export", "#1B5E55", "#FFFFFF").pack(side="left", padx=(8, 0))
-
-        action_panel = tk.Frame(
-            header,
-            bg="#F4F8FB",
-            highlightbackground="#365576",
-            highlightthickness=1,
-            padx=12,
-            pady=12,
+        actions = (
+            ("+ Axis", self.add_axis, "Secondary.TButton"),
+            ("- Axis", self.remove_axis, "Secondary.TButton"),
+            ("Load Demo", self.load_demo_data, "Secondary.TButton"),
+            ("Clear All", self.clear_all, "Secondary.TButton"),
+            ("Calculate Preview", self.calculate_preview, "Accent.TButton"),
+            ("Export PDF", self.export_current_pdf, "Accent.TButton"),
         )
-        action_panel.grid(row=1, column=1, rowspan=3, sticky="e")
-        action_panel.columnconfigure(0, weight=1)
-        action_panel.columnconfigure(1, weight=1)
-
-        tk.Label(
-            action_panel,
-            text="Quick Actions",
-            bg="#F4F8FB",
-            fg=TEXT,
-            font=("Segoe UI Semibold", 10),
-        ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 10))
-
-        ttk.Button(
-            action_panel,
-            text="Load Demo",
-            command=self.load_demo_data,
-            style="Secondary.TButton",
-        ).grid(row=1, column=0, sticky="ew", padx=(0, 6))
-        ttk.Button(
-            action_panel,
-            text="Clear All",
-            command=self.clear_all,
-            style="Secondary.TButton",
-        ).grid(row=1, column=1, sticky="ew", padx=(6, 0))
-        ttk.Button(
-            action_panel,
-            text="Calculate Preview",
-            command=self.calculate_preview,
-            style="Accent.TButton",
-        ).grid(row=2, column=0, sticky="ew", pady=(8, 0), padx=(0, 6))
-        ttk.Button(
-            action_panel,
-            text="Export PDF",
-            command=self.export_current_pdf,
-            style="Accent.TButton",
-        ).grid(row=2, column=1, sticky="ew", pady=(8, 0), padx=(6, 0))
-        ttk.Button(
-            action_panel,
-            text="+ Axis",
-            command=self.add_axis,
-            style="Secondary.TButton",
-        ).grid(row=3, column=0, sticky="ew", pady=(8, 0), padx=(0, 6))
-        ttk.Button(
-            action_panel,
-            text="- Axis",
-            command=self.remove_axis,
-            style="Secondary.TButton",
-        ).grid(row=3, column=1, sticky="ew", pady=(8, 0), padx=(6, 0))
+        for column, (label, command, style) in enumerate(actions, start=1):
+            ttk.Button(header, text=label, command=command, style=style).grid(
+                row=0, column=column, padx=(6, 0)
+            )
 
         body = ttk.Frame(self, padding=14, style="Surface.TFrame")
         body.grid(row=1, column=0, sticky="nsew")
@@ -1200,11 +1119,9 @@ class CpkReporterApp(tk.Tk):
         self.notebook.grid(row=0, column=0, sticky="nsew")
         self.notebook.bind("<<NotebookTabChanged>>", self._handle_main_tab_change)
 
-        overview_tab = ttk.Frame(self.notebook, padding=0, style="Surface.TFrame")
-        overview_tab.columnconfigure(0, weight=1)
-        overview_tab.rowconfigure(0, weight=1)
+        overview_tab = ScrollablePanel(self.notebook, background=SURFACE)
         self.notebook.add(overview_tab, text="Report Info")
-        self._build_overview_tab(overview_tab)
+        self._build_overview_tab(overview_tab.content)
 
         for axis_name in DEFAULT_AXIS_NAMES:
             self._add_axis_tab(axis_name=axis_name, select=False)
@@ -1305,6 +1222,7 @@ class CpkReporterApp(tk.Tk):
             axis_color_for_index(len(self.axis_order)),
             on_request_rename=self.rename_axis,
             on_request_remove=self.remove_axis,
+            on_inputs_changed=self._mark_results_stale,
         )
         self.axis_frames[axis_key] = axis_frame
         self.axis_order.append(axis_key)
@@ -1328,7 +1246,6 @@ class CpkReporterApp(tk.Tk):
         tab_index = self.axis_order.index(axis_key)
         fallback_index = max(0, tab_index - 1)
 
-        frame.close_resources()
         self.notebook.forget(frame)
         frame.destroy()
 
@@ -1402,7 +1319,7 @@ class CpkReporterApp(tk.Tk):
             ("01", "Multi-Axis Study", "Add, rename, and review multiple axis tabs in one audit package.", HEADER_BG, "#FFFFFF", HEADER_SOFT),
             ("30", "Measurements / Axis", "Structured table for 30 repeatability values with cleaner grouping.", ACCENT, "#FFFFFF", "#DDF7F2"),
             ("XL", "Excel Query", "Load a sheet and range directly into the measurement table.", GOLD, "#102A43", GOLD_SOFT),
-            ("PDF", "Review to Export", "Preview tabs mirror the final multi-page PDF layout.", "#1F4F6E", "#FFFFFF", "#D9EAF6"),
+            ("PDF", "Review to Export", "Review capability, charts and PPM before exporting the report.", "#1F4F6E", "#FFFFFF", "#D9EAF6"),
         )
         for index, (eyebrow, title, detail, bg_color, title_fg, detail_fg) in enumerate(cards):
             card = tk.Frame(
@@ -1474,6 +1391,15 @@ class CpkReporterApp(tk.Tk):
             justify="left",
             wraplength=1240,
         ).grid(row=1, column=0, sticky="w", pady=(5, 0))
+
+        template_actions = tk.Frame(intro_panel, bg=HEADER_BG)
+        template_actions.grid(row=2, column=0, sticky="w", pady=(10, 0))
+        ttk.Button(template_actions, text="Download Excel Template", command=self.download_excel_template,
+                   style="Secondary.TButton").pack(side="left")
+        ttk.Button(template_actions, text="Import Filled Template", command=self.import_excel_template,
+                   style="Secondary.TButton").pack(side="left", padx=(8, 0))
+        tk.Label(template_actions, text=f"{EXPECTED_SAMPLE_COUNT} readings per axis (mm) | Optional specifications",
+                 bg=HEADER_BG, fg=HEADER_SOFT, font=("Segoe UI", 9)).pack(side="left", padx=12)
 
         form_frame = ttk.LabelFrame(parent, text="Report Fields")
         form_frame.grid(row=1, column=0, sticky="ew", padx=16, pady=(0, 14))
@@ -1557,6 +1483,7 @@ class CpkReporterApp(tk.Tk):
             "overall_sigma",
             "cpk",
             "ppk",
+            "cpm",
             "requirement",
             "oos",
             "result",
@@ -1569,6 +1496,7 @@ class CpkReporterApp(tk.Tk):
             "overall_sigma": "Overall Sigma",
             "cpk": "Cpk",
             "ppk": "Ppk",
+            "cpm": "Cpm",
             "requirement": "Required",
             "oos": "Observed OOS",
             "result": "Result",
@@ -1580,6 +1508,7 @@ class CpkReporterApp(tk.Tk):
             "overall_sigma": 130,
             "cpk": 95,
             "ppk": 95,
+            "cpm": 80,
             "requirement": 100,
             "oos": 130,
             "result": 100,
@@ -1662,10 +1591,54 @@ class CpkReporterApp(tk.Tk):
             self.set_status("PDF export cancelled")
             return
 
-        export_pdf(metadata, reports, destination)
+        try:
+            export_pdf(metadata, reports, destination)
+        except OSError as exc:
+            messagebox.showerror("PDF export error", str(exc))
+            self.set_status("PDF export failed")
+            return
         self.set_status(f"PDF exported: {destination}")
         messagebox.showinfo("Export complete", f"PDF report saved to:\n{destination}")
 
+
+    def download_excel_template(self) -> None:
+        destination = filedialog.asksaveasfilename(
+            parent=self, title="Save Excel Template", initialfile="Cpk_Measurements_Template.xlsx",
+            defaultextension=".xlsx", filetypes=[("Excel Workbook", "*.xlsx")],
+        )
+        if not destination:
+            return
+        path = Path(destination)
+        if path.suffix.lower() != ".xlsx":
+            messagebox.showerror("Excel template error", "Save the template with the .xlsx extension.", parent=self)
+            return
+        try:
+            save_excel_template(path, [self.axis_frames[key].axis_name for key in self.axis_order])
+        except OSError as exc:
+            messagebox.showerror("Excel template error", str(exc), parent=self)
+            return
+        self.set_status(f"Template saved: {path}")
+
+    def import_excel_template(self) -> None:
+        selected = filedialog.askopenfilename(parent=self, title="Import Filled Excel Template",
+                                              filetypes=[("Excel Workbook", "*.xlsx")])
+        if not selected:
+            return
+        path = Path(selected)
+        frames = {self.axis_frames[key].axis_name: self.axis_frames[key] for key in self.axis_order}
+        try:
+            readings, specs = read_excel_template(path, list(frames))
+        except Exception as exc:
+            messagebox.showerror("Excel template import error", str(exc), parent=self)
+            return
+        for column, (axis, values) in enumerate(readings.items(), start=2):
+            frames[axis].apply_template_column(path, column, values, specs.get(axis))
+        missing_limits = any(not (frame.lsl_var.get().strip() and frame.usl_var.get().strip())
+                             for frame in frames.values())
+        next_step = ("Enter LSL and USL in the axis tabs, then click Calculate Preview."
+                     if missing_limits else "Click Calculate Preview.")
+        self._mark_results_stale(f"Imported {EXPECTED_SAMPLE_COUNT} readings for each of {len(frames)} axes "
+                                 f"from {path.name}. {next_step}")
 
     def load_demo_data(self) -> None:
         self._invalidate_cached_reports()
@@ -1750,6 +1723,12 @@ class CpkReporterApp(tk.Tk):
         )
 
 
+    def _mark_results_stale(self, message: str) -> None:
+        self._invalidate_cached_reports()
+        self._clear_summary_view()
+        self.summary_note_var.set(message)
+        self.set_status(message)
+
     def _invalidate_cached_reports(self) -> None:
         self._cached_axis_token = None
         self._cached_reports = None
@@ -1776,6 +1755,7 @@ class CpkReporterApp(tk.Tk):
                         format_metric(report.overall_std, 4),
                         format_metric(report.cpk, 3),
                         format_metric(report.ppk, 3),
+                        format_metric(report.cpm, 3),
                         format_metric(report.spec.cpk_requirement, 2),
                         f"{report.observed_oos_count} ({report.observed_oos_percent:.2f}%)",
                         report.status,
@@ -1783,7 +1763,7 @@ class CpkReporterApp(tk.Tk):
                     tags=(report.status,),
                 )
 
-        overall_status = "PASS" if all(report.status == "PASS" for report in reports) else "FAIL"
+        overall_status = overall_result(reports)
         self.summary_note_var.set(
             f"{metadata.report_title} | Customer: {metadata.customer_name or '-'} | Overall result: {overall_status}"
         )
@@ -1813,18 +1793,6 @@ class CpkReporterApp(tk.Tk):
         return None
 
 
-    def _on_close(self) -> None:
-        for axis_key in self.axis_order:
-            self.axis_frames[axis_key].close_resources()
-        self.destroy()
-
-
-    def destroy(self) -> None:
-        for axis_key in self.axis_order:
-            self.axis_frames[axis_key].close_resources()
-        super().destroy()
-
-
     @staticmethod
     def _add_overview_entry(parent, label_text: str, variable: tk.StringVar, row: int, column: int) -> None:
         holder = ttk.Frame(parent, style="Surface.TFrame")
@@ -1835,11 +1803,7 @@ class CpkReporterApp(tk.Tk):
 
 
 def _generate_demo_values(rng: random.Random, mean: float, sigma: float) -> list[float]:
-    return [rng.gauss(mean, sigma) for _ in range(EXPECTED_SAMPLE_COUNT)]
-
-
-def _format_input_value(value: float) -> str:
-    return f"{value:.5f}".rstrip("0").rstrip(".")
+    return [round(rng.gauss(mean, sigma), 5) for _ in range(EXPECTED_SAMPLE_COUNT)]
 
 
 def _safe_filename(text: str) -> str:
